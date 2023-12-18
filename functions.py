@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+from osgeo import gdal
 from tqdm import tqdm
 from scipy.stats import gaussian_kde
 
@@ -265,7 +266,7 @@ def apply_colormap(input_image, colormap_name):
     colored_image = (cmap(input_image) * 255).astype(np.uint8)
     return colored_image
 
-def save_subs(output_hie_path, output, inputraster, xy_list):
+def save_subs(output_hie_path, output, inputraster, xy_list, mask=None, mode="rgb"):
     folder, _ = os.path.split(output_hie_path)
     if not os.path.exists(folder):
         os.makedirs(folder)
@@ -285,7 +286,45 @@ def save_subs(output_hie_path, output, inputraster, xy_list):
     base = np.zeros_like(inputraster, dtype=np.int8)
     for h in himgs:
         base = np.where(h != 0, h, base)
-    base = base/base.max()
 
-    colored_image = apply_colormap(base, "Spectral")
-    cv2.imwrite(output_hie_path, colored_image)
+    if mode == 'rgb':
+        base = base/base.max()
+        colored_image = apply_colormap(base, "Spectral")
+        cv2.imwrite(output_hie_path, colored_image)
+        
+    elif mode == 'gray':
+        cv2.imwrite(output_hie_path, base)
+
+def save_subs_geo(output_hie_path, output, inputraster, xy_list, projection, geotransform, mask=None):
+
+    folder, _ = os.path.split(output_hie_path)
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+
+    himgs = []
+    for i, lr in enumerate(output):
+        himg = np.zeros_like(inputraster, dtype=np.int8)
+
+        for j, current_image in enumerate(lr):
+            y, x = xy_list[i][j]
+            current_image = np.where(current_image > 0, i + 1, 0).astype(np.int32)
+            x_end, y_end = x + current_image.shape[0], y + current_image.shape[1]
+            himg[x:x_end, y:y_end] = current_image
+
+        himgs.append(himg)
+
+    base = np.zeros_like(inputraster, dtype=np.int8)
+    for h in himgs:
+        base = np.where(h != 0, h, base)
+
+    if mask is not None:
+        base[mask] = 255
+
+    driver = gdal.GetDriverByName('GTiff')
+    output_dataset = driver.Create(output_hie_path, base.shape[1], base.shape[0], 1, gdal.GDT_Int16)
+
+    output_dataset.SetGeoTransform(geotransform)
+    output_dataset.nodata = 255
+    output_dataset.SetProjection(projection)
+    output_dataset.GetRasterBand(1).WriteArray(base)
+    output_dataset.FlushCache()
