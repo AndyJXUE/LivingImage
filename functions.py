@@ -4,9 +4,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from osgeo import gdal
+from osgeo import gdal, ogr, osr
 from tqdm import tqdm
-from scipy.stats import gaussian_kde
 
 def percent_clip(img_array, percent):
     # 将图像转换为numpy数组
@@ -78,7 +77,7 @@ def head_tail_breaks(array, break_per=0.4):
     del head_mean, array, rats
     return ht_index
 
-def Clip(img, lb_images, stats, centers, xy_last, thre=0.00001, focus="dark"):
+def Clip(img, lb_images, stats, centers, xy_last, thre=0.00001):
     # 获取所有连通区域的面积
     areas = stats[:, cv2.CC_STAT_AREA]
 
@@ -111,12 +110,14 @@ def Clip(img, lb_images, stats, centers, xy_last, thre=0.00001, focus="dark"):
     del img, lb_images, stats, centers
     return regions_list, centers_list, original_xy
 
-def process_hierarchy(regions_list, xy_last_list, focus, break_per=0.4, first=False):
-    return_list, centers_list, xy_list, d_index, areas_list = [], [], [], [], []
+def process_hierarchy(regions_list, xy_last_list, focus, nodes, break_per=0.4, first=False):
+    return_list, centers_list, xy_list, d_index, areas_list, sources, targets = [], [], [], [], [], [], []
     s, d, lr = 0, 0, 0
 
     with tqdm(total=len(regions_list), desc="Processing regions") as pbar:
         for i, region in enumerate(regions_list):
+
+            node = nodes[i]
             bin_image = BinarizeRaster(region, focus)
 
             num_labels, lb_images, stats, centers = cv2.connectedComponentsWithStats(
@@ -130,10 +131,15 @@ def process_hierarchy(regions_list, xy_last_list, focus, break_per=0.4, first=Fa
             ht_index = head_tail_breaks(areas, break_per)
 
             if ht_index > 2 or first:
-                d_index.append(i)
+
+                d_index.append(node)
                 regions_list_new, centers, xy = Clip(
-                    region, lb_images, stats, centers, xy_last_list[i], focus=focus 
+                    region, lb_images, stats, centers, xy_last_list[i] 
                 )
+                
+                sources.extend([node] * len(regions_list_new))
+                targets.extend([ nodes[-1] + i + 1 + len(return_list) for i in range(len(regions_list_new))])
+
                 return_list.extend(regions_list_new)
                 centers_list.extend(centers)
                 xy_list.extend(xy)
@@ -142,18 +148,19 @@ def process_hierarchy(regions_list, xy_last_list, focus, break_per=0.4, first=Fa
                 s += num_labels
                 lr += ht_index * num_labels
                 areas_list.extend(areas)
-            pbar.update(1)
 
-    return return_list, d, s, lr, xy_list, d_index,
+            pbar.update(1)
+    nodes = [i + nodes[-1] + 1 for i in range(len(return_list))]
+    return return_list, d, s, lr, xy_list, d_index, nodes, sources, targets
 
 def process_recursively(inputraster, focus):
     i = 0
     xy = np.zeros(2, dtype=int)
-    results = []
+    results, nodes = [], [1]
 
     while True:
-        return_list, d, s, lr, xy, d_index = process_hierarchy(
-            [inputraster] if i == 0 else return_list, xy, focus)
+        return_list, d, s, lr, xy, d_index, nodes, sources, targets = process_hierarchy(
+            [inputraster] if i == 0 else return_list, xy, focus, nodes)
 
         if len(return_list) == 0:
             break
@@ -168,7 +175,9 @@ def process_recursively(inputraster, focus):
             'd': d,
             'lr': lr,
             'd_index': d_index,
-            'xy': xy
+            'xy' :xy,
+            'sources': sources,
+            'targets': targets
         })
 
     return results
@@ -201,65 +210,6 @@ def save_result(csv_path, d_array, s_array, lr_array, i):
 
     # Write the DataFrame to a CSV file
     df.to_csv(csv_path, index=False)
-
-def heatmap(heat_path, fcenters_list, inputraster, width, height):
-    folder, _ = os.path.split(heat_path)
-    if not os.path.exists(folder):
-        os.makedirs(folder)
-    x_grid, y_grid = np.meshgrid(np.arange(width), np.arange(height))
-    # 将网格点展平
-    grid_points = np.vstack((x_grid.ravel(), y_grid.ravel()))
-    # 提取坐标点
-    coordinate_points = np.array(fcenters_list).T
-    # 计算核密度估计
-    kde = gaussian_kde(coordinate_points, 0.1)
-    # 在网格上计算核密度值
-    density_values = kde(grid_points)
-    density_map = density_values.reshape(height, width)
-    # 对密度图进行平滑以获得更圆润的结果
-    # density_map = gaussian_filter(density_map, sigma=5)
-    # 将密度值映射到对数空间
-    log_density_map = np.log(density_map + 1)  # 加1以避免log(0)
-
-    # 找到最小和最大的对数密度值
-    min_log_density = np.min(log_density_map)
-    max_log_density = np.max(log_density_map)
-    mask = (
-        (log_density_map - min_log_density) / (max_log_density - min_log_density)
-    ) * 255
-    # mask = 100000*((density_map-density_map.min())/(density_map.max()-density_map.min())).astype(np.uint8)
-    heat_img = cv2.applyColorMap(
-        mask.astype(np.uint8), cv2.COLORMAP_JET
-    )  # 此处的三通道热力图是cv2使用GBR排列
-    inputraster[inputraster == -1] = 255
-    inputraster = cv2.cvtColor(inputraster.astype(np.uint8), cv2.COLOR_GRAY2RGB)
-    add_img = cv2.addWeighted(inputraster, 0.3, heat_img, 0.7, 0)
-    cv2.imwrite(heat_path, add_img)
-
-def write_decs(output_hie_path, output, inputraster, lb_images, xy_list, d_index_list):
-    # All substructures, except H1
-    folder, _ = os.path.split(output_hie_path)
-    if not os.path.exists(folder):
-        os.makedirs(folder)
-    base = np.zeros(np.shape(inputraster)).astype(np.int8)
-    for i in range(0, len(output) - 1):
-        himg = np.zeros(np.shape(inputraster)).astype(np.int8)
-        d = d_index_list[i + 1]
-        lr = output[i]
-        for j in d:
-            c = lr[j]
-            # 获取当前影像和坐标位置
-            ci = np.where(c >= 0, i + 1, 0).astype(np.int8)
-            y, x = xy_list[i][j]
-            # 将当前影像插入到新影像中
-            himg[x : x + ci.shape[0], y : y + ci.shape[1]] = ci
-        base[himg != 0] = 0
-        if i == 0:
-            base += himg
-        else:
-            base[himg != 0] = 0
-            base = base + himg
-    cv2.imwrite(output_hie_path, base)
 
 def apply_colormap(input_image, colormap_name):
     cmap = plt.get_cmap(colormap_name)
@@ -328,3 +278,79 @@ def save_subs_geo(output_hie_path, output, inputraster, xy_list, projection, geo
     output_dataset.SetProjection(projection)
     output_dataset.GetRasterBand(1).WriteArray(base)
     output_dataset.FlushCache()
+
+def save_gephi(output_gephi, sources, targets, d_indexes):
+    if not os.path.exists(output_gephi):
+        os.makedirs(output_gephi)
+
+    output_gephi_edge = os.path.join(output_gephi, "edge.csv")
+    output_gephi_node_dec = os.path.join(output_gephi, "edge_dec.csv")
+
+    df_edge = pd.DataFrame({
+        "Source": sources,
+        "Target": targets,
+        "I": [1] * len(sources),
+    })
+
+    f_indexes = [d_index for sublist in d_indexes for d_index in sublist]
+    valid_nodes = set(f_indexes)
+    df_edge_dec = df_edge[df_edge["Source"].isin(valid_nodes) & df_edge["Target"].isin(valid_nodes)]
+    
+    for d, d_list in enumerate(d_indexes):
+        for i in range(len(df_edge_dec['I'])):
+            s = sources[i]
+            if s in d_list:
+                df_edge_dec.iloc[i]['I'] = d + 1
+                
+    df_edge.to_csv(output_gephi_edge, index=False)
+    df_edge_dec.to_csv(output_gephi_node_dec, index=False)
+
+def save_centers(output_cen_path, xy_list, projection=None, geotransform=None):
+    # Ensure the output directory exists
+    folder, _ = os.path.split(output_cen_path)
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+
+    # Create a new Shapefile
+    driver = ogr.GetDriverByName('ESRI Shapefile')
+    ds = driver.CreateDataSource(output_cen_path)
+    layer = ds.CreateLayer(output_cen_path, geom_type=ogr.wkbPoint)
+    
+    # Define fields (h, x, y)
+    layer.CreateField(ogr.FieldDefn('h', ogr.OFTInteger))
+    layer.CreateField(ogr.FieldDefn('x', ogr.OFTReal))
+    layer.CreateField(ogr.FieldDefn('y', ogr.OFTReal))
+
+    for h, xys in enumerate(xy_list):
+        for xy in xys:
+            x, y = xy  # Extract x and y coordinates
+
+            if geotransform is not None:
+                # Apply geotransformation
+                x_map = geotransform[0] + x * geotransform[1] + y * geotransform[2]
+                y_map = geotransform[3] + x * geotransform[4] + y * geotransform[5]
+            else:
+                # If no geotransform, use x and y as they are
+                x_map = float(x)
+                y_map = float(y)
+
+            # Create a new feature
+            feature = ogr.Feature(layer.GetLayerDefn())
+            feature.SetField('h', h)
+            feature.SetField('x', x_map)
+            feature.SetField('y', y_map)
+            
+            # Create point geometry
+            point = ogr.Geometry(ogr.wkbPoint)
+            point.AddPoint(x_map, y_map)
+            feature.SetGeometry(point)
+            
+            # Add the feature to the layer
+            layer.CreateFeature(feature)
+            
+    # If a projection is provided, set the spatial reference
+    if projection is not None:
+        layer.GetSpatialRef().ImportFromWkt(projection)
+    
+    # Cleanup
+    ds = None
